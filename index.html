@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#87c8eb">
+<title>Offline Runner</title>
+<style>
+  :root { --bg: #f4f1ea; --fg: #2b2b2b; --muted: #6b6b6b; --kbd: #e3ded3; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16181d; --fg: #e8e6e1; --muted: #9a9890; --kbd: #2a2d35; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 16px;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    max-width: 960px;
+    aspect-ratio: 8 / 3;
+    border-radius: 12px;
+    box-shadow: 0 6px 28px rgba(0, 0, 0, .18);
+    touch-action: none;
+    cursor: pointer;
+  }
+  .help {
+    max-width: 960px;
+    font-size: 14px;
+    line-height: 1.8;
+    color: var(--muted);
+    text-align: center;
+  }
+  kbd {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    background: var(--kbd);
+    color: var(--fg);
+    border-radius: 4px;
+    padding: 1px 6px;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Endless runner game"></canvas>
+<div class="help">
+  <kbd>Space</kbd> / <kbd>↑</kbd> jump (hold for higher) ·
+  <kbd>↓</kbd> duck / fast-fall ·
+  <kbd>P</kbd> pause ·
+  <kbd>M</kbd> sound<br>
+  Touch: tap the right side to jump, hold the left side to duck
+</div>
+<noscript>This game needs JavaScript enabled.</noscript>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------- Constants ----------
+  const W = 800, H = 300, GROUND = 252;
+  const STEP = 1 / 120;
+  const START_SPEED = 380, MAX_SPEED = 950, ACCEL = 9;
+  const GRAVITY = 2700, JUMP_V = 860;
+  const COYOTE = 0.08, JUMP_BUFFER = 0.12;
+  const STAND = { w: 36, h: 50 }, DUCK = { w: 52, h: 30 };
+
+  const SHIRT = '#ff6b35', PANTS = '#2d3047', PANTS_BACK = '#1e2033',
+        SKIN = '#f2c29b', SKIN_BACK = '#d9a57c', BAND = '#1b998b',
+        BIRD = '#6c4f8c', BEAK = '#f4a261';
+
+  const DAY = {
+    skyTop: [135, 200, 235], skyBot: [236, 246, 250], far: [178, 212, 200],
+    near: [136, 190, 148], ground: [224, 198, 152], line: [120, 90, 60],
+    pebble: [176, 146, 104], text: [45, 45, 45], cactus: [58, 150, 90],
+    cactusDark: [38, 110, 64], cloud: [255, 255, 255],
+  };
+  const NIGHT = {
+    skyTop: [14, 18, 44], skyBot: [46, 56, 98], far: [42, 52, 84],
+    near: [30, 40, 66], ground: [72, 66, 78], line: [30, 28, 36],
+    pebble: [52, 48, 58], text: [236, 236, 246], cactus: [44, 116, 80],
+    cactusDark: [28, 80, 54], cloud: [92, 102, 142],
+  };
+
+  // ---------- Canvas ----------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    const cssW = canvas.getBoundingClientRect().width || W;
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssW * dpr * H / W);
+    ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------- Storage (optional, may be unavailable) ----------
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } },
+  };
+  let best = parseInt(store.get('runner.best'), 10) || 0;
+  let muted = store.get('runner.muted') === '1';
+
+  // ---------- Sound (generated, no files needed) ----------
+  let actx = null;
+  function beep(freq, dur, type = 'square', vol = 0.05, slide = 0) {
+    if (muted) return;
+    try {
+      actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') actx.resume();
+      const t = actx.currentTime;
+      const o = actx.createOscillator(), g = actx.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, t);
+      if (slide) o.frequency.exponentialRampToValueAtTime(freq * slide, t + dur);
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g).connect(actx.destination);
+      o.start(t);
+      o.stop(t + dur);
+    } catch (e) { /* audio not available */ }
+  }
+
+  // ---------- Helpers ----------
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const lerp = (a, b, t) => a + (b - a) * t;
+  function mix(key, t) {
+    const a = DAY[key], b = NIGHT[key];
+    return `rgb(${Math.round(lerp(a[0], b[0], t))},${Math.round(lerp(a[1], b[1], t))},${Math.round(lerp(a[2], b[2], t))})`;
+  }
+  function rr(x, y, w, h, r, color) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    ctx.fill();
+  }
+  function circle(x, y, r, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  function line(x1, y1, x2, y2, color, width) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  }
+  function overlaps(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  // ---------- Game state ----------
+  const input = { jump: false, duck: false };
+  let state = 'ready'; // ready | running | paused | over
+  let player, obstacles, particles, speed, distance, spawnIn;
+  let milestone, flash, shake, overTimer, night, farOff, nearOff, time;
+
+  const clouds = Array.from({ length: 6 }, () => ({ x: rand(0, W), y: rand(20, 110), s: rand(0.7, 1.3) }));
+  const stars = Array.from({ length: 50 }, () => ({ x: rand(0, W), y: rand(0, 170), r: rand(0.5, 1.6) }));
+  const pebbles = Array.from({ length: 36 }, () => ({ x: rand(0, W), y: rand(GROUND + 6, H - 6), w: rand(2, 6) }));
+
+  function reset() {
+    player = { x: 90, y: GROUND, vy: 0, onGround: true, ducking: false, anim: 0, coyote: 0, buffer: 0 };
+    obstacles = [];
+    particles = [];
+    speed = START_SPEED;
+    distance = 0;
+    spawnIn = 500;
+    milestone = 0;
+    flash = 0;
+    shake = 0;
+    overTimer = 0;
+    time = 0;
+  }
+  night = 0; farOff = 0; nearOff = 0;
+  reset();
+
+  const score = () => Math.floor(distance / 10);
+
+  function start() {
+    reset();
+    state = 'running';
+  }
+
+  function gameOver() {
+    state = 'over';
+    overTimer = 0;
+    shake = 0.35;
+    const s = score();
+    if (s > best) { best = s; store.set('runner.best', String(best)); }
+    beep(220, 0.25, 'sawtooth', 0.06, 0.4);
+    for (let i = 0; i < 18; i++) {
+      particles.push({ x: player.x + 18, y: player.y - 25, vx: rand(-220, 220), vy: rand(-380, -60), life: rand(0.4, 0.8), max: 0.8, c: SHIRT, r: rand(2, 4) });
+    }
+  }
+
+  function togglePause() {
+    if (state === 'running') state = 'paused';
+    else if (state === 'paused') state = 'running';
+  }
+
+  function toggleMute() {
+    muted = !muted;
+    store.set('runner.muted', muted ? '1' : '0');
+    if (!muted) beep(660, 0.08);
+  }
+
+  function pressJump() {
+    input.jump = true;
+    if (state === 'ready') { start(); player.buffer = JUMP_BUFFER; }
+    else if (state === 'running') player.buffer = JUMP_BUFFER;
+    else if (state === 'paused') togglePause();
+    else if (state === 'over' && overTimer > 0.45) { start(); player.buffer = JUMP_BUFFER; }
+  }
+
+  function dust(x, y, n, spread) {
+    for (let i = 0; i < n; i++) {
+      particles.push({ x: x + rand(-6, 6), y: y - 2, vx: rand(-spread, spread * 0.3) - speed * 0.3, vy: rand(-120, -20), life: rand(0.25, 0.5), max: 0.5, c: null, r: rand(1.5, 3) });
+    }
+  }
+
+  // ---------- Obstacles ----------
+  function spawn() {
+    const s = score();
+    const r = Math.random();
+    let o;
+    if (s > 250 && r < 0.25) {
+      const levels = s > 500 ? [34, 60, 100] : [34, 60];
+      const lift = levels[Math.floor(Math.random() * levels.length)];
+      o = { type: 'bird', x: W + 20, y: GROUND - lift, w: 44, h: 28, flap: rand(0, 6) };
+    } else {
+      const big = r > 0.62;
+      const maxN = big ? (speed > 600 && Math.random() < 0.4 ? 2 : 1) : (speed > 520 ? 3 : 2);
+      const n = 1 + Math.floor(Math.random() * maxN);
+      const cw = big ? 26 : 18, baseH = big ? rand(48, 56) : rand(32, 40);
+      const trunks = [];
+      for (let i = 0; i < n; i++) {
+        trunks.push({
+          dx: i * (cw + 4), w: cw, h: baseH - (i % 2) * rand(0, 8),
+          armL: Math.random() < 0.8 ? rand(0.3, 0.5) : 0,
+          armR: Math.random() < 0.8 ? rand(0.25, 0.45) : 0,
+        });
+      }
+      o = { type: 'cactus', x: W + 20, w: n * cw + (n - 1) * 4, trunks };
+    }
+    obstacles.push(o);
+    // Gap scales with speed so every obstacle stays jumpable.
+    const airTime = 2 * JUMP_V / GRAVITY;
+    const minGap = speed * airTime + 140;
+    spawnIn = o.w + minGap + Math.random() * (minGap * 0.9 + 160);
+  }
+
+  function hitboxes(o) {
+    if (o.type === 'bird') return [{ x: o.x + 6, y: o.y + 6, w: o.w - 12, h: o.h - 12 }];
+    return o.trunks.map(t => ({ x: o.x + t.dx + 3, y: GROUND - t.h + 3, w: t.w - 6, h: t.h - 3 }));
+  }
+
+  function playerBox() {
+    const d = player.ducking ? DUCK : STAND;
+    return { x: player.x + 6, y: player.y - d.h + 6, w: d.w - 12, h: d.h - 8 };
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+    // Scenery drifts even on menus so the world feels alive.
+    const bgSpeed = state === 'running' ? speed : state === 'ready' ? 60 : 0;
+    farOff += bgSpeed * 0.1 * dt;
+    nearOff += bgSpeed * 0.3 * dt;
+    for (const c of clouds) {
+      c.x -= bgSpeed * 0.15 * c.s * dt;
+      if (c.x < -100) { c.x = W + rand(20, 200); c.y = rand(20, 110); }
+    }
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.life -= dt;
+      if (p.life <= 0) { particles.splice(i, 1); continue; }
+      p.vy += 900 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+    }
+    shake = Math.max(0, shake - dt);
+
+    if (state === 'over') { overTimer += dt; return; }
+    if (state !== 'running') return;
+
+    time += dt;
+    speed = Math.min(MAX_SPEED, speed + ACCEL * dt);
+    distance += speed * dt;
+
+    const s = score();
+    if (Math.floor(s / 100) > milestone) {
+      milestone = Math.floor(s / 100);
+      flash = 1;
+      beep(880, 0.07);
+      setTimeout(() => beep(1320, 0.1), 80);
+    }
+    flash = Math.max(0, flash - dt);
+
+    // Day/night every 700 points.
+    const target = Math.floor(s / 700) % 2;
+    night += (target - night) * Math.min(1, dt * 0.8);
+
+    for (const pb of pebbles) {
+      pb.x -= speed * dt;
+      if (pb.x < -10) { pb.x = W + rand(0, 40); pb.y = rand(GROUND + 6, H - 6); }
+    }
+
+    // Player physics
+    const p = player;
+    p.coyote = p.onGround ? COYOTE : p.coyote - dt;
+    p.buffer -= dt;
+    if (p.buffer > 0 && p.coyote > 0) {
+      p.vy = -JUMP_V;
+      p.onGround = false;
+      p.coyote = 0;
+      p.buffer = 0;
+      beep(520, 0.12, 'square', 0.04, 1.8);
+      dust(p.x + 18, GROUND, 5, 80);
+    }
+    let g = GRAVITY;
+    if (!p.onGround) {
+      if (input.duck) g *= 3;                       // fast fall
+      else if (p.vy < 0 && !input.jump) g *= 2.2;   // short hop on early release
+    }
+    p.vy += g * dt;
+    p.y += p.vy * dt;
+    if (p.y >= GROUND) {
+      if (!p.onGround && p.vy > 300) dust(p.x + 18, GROUND, 6, 100);
+      p.y = GROUND;
+      p.vy = 0;
+      p.onGround = true;
+    }
+    p.ducking = input.duck && p.onGround;
+    if (p.onGround) p.anim += dt * speed / 38;
+
+    // Obstacles
+    spawnIn -= speed * dt;
+    if (spawnIn <= 0) spawn();
+    const pb = playerBox();
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+      const o = obstacles[i];
+      o.x -= (o.type === 'bird' ? speed + 60 : speed) * dt;
+      if (o.type === 'bird') o.flap += dt * 14;
+      if (o.x + o.w < -30) { obstacles.splice(i, 1); continue; }
+      if (hitboxes(o).some(b => overlaps(pb, b))) { gameOver(); return; }
+    }
+  }
+
+  // ---------- Render ----------
+  function drawHills(off, base, amp, freq, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(0, GROUND);
+    for (let x = 0; x <= W + 10; x += 10) {
+      const wx = x + off;
+      const y = base - amp * (0.5 + 0.5 * Math.sin(wx * freq)) - amp * 0.35 * Math.sin(wx * freq * 2.3 + 1.3);
+      ctx.lineTo(x, y);
+    }
+    ctx.lineTo(W, GROUND);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawCloud(c, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, 14 * c.s, 0, Math.PI * 2);
+    ctx.arc(c.x + 18 * c.s, c.y - 8 * c.s, 18 * c.s, 0, Math.PI * 2);
+    ctx.arc(c.x + 38 * c.s, c.y, 14 * c.s, 0, Math.PI * 2);
+    ctx.rect(c.x, c.y, 38 * c.s, 14 * c.s);
+    ctx.fill();
+  }
+
+  function limb(x, y, a, len1, len2, bend, color, width) {
+    const kx = x + Math.sin(a) * len1, ky = y + Math.cos(a) * len1;
+    const b = a + bend;
+    const fx = kx + Math.sin(b) * len2, fy = ky + Math.cos(b) * len2;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(kx, ky);
+    ctx.lineTo(fx, fy);
+    ctx.stroke();
+  }
+
+  function drawEye(x, y) {
+    if (state === 'over') {
+      line(x - 2, y - 2, x + 2, y + 2, '#222', 1.5);
+      line(x - 2, y + 2, x + 2, y - 2, '#222', 1.5);
+    } else {
+      circle(x, y, 1.7, '#222');
+    }
+  }
+
+  function drawPlayer() {
+    const p = player, x = p.x, y = p.y;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    if (p.ducking) {
+      const s = Math.sin(p.anim);
+      limb(x + 12, y - 14, s * 0.9, 8, 7, -0.4, PANTS_BACK, 5);
+      limb(x + 12, y - 14, -s * 0.9, 8, 7, -0.4, PANTS, 5);
+      rr(x + 6, y - 26, 32, 14, 7, SHIRT);
+      limb(x + 34, y - 18, 0.6, 6, 6, 0.8, SKIN, 4);
+      circle(x + 44, y - 21, 8, SKIN);
+      ctx.fillStyle = BAND;
+      ctx.fillRect(x + 36, y - 26, 16, 3);
+      drawEye(x + 47, y - 21);
+      return;
+    }
+
+    const air = !p.onGround;
+    const s = air ? 0 : Math.sin(p.anim);
+    const hipX = x + 19, hipY = y - 18;
+    const legA = air ? 0.9 : s * 0.8, legB = air ? -0.35 : -s * 0.8;
+    const shinBend = a => (a < 0 ? -0.9 : -0.1);
+
+    // Back limbs
+    limb(hipX, hipY, legB, 10, 9, air ? -1.2 : shinBend(legB), PANTS_BACK, 6);
+    limb(x + 20, y - 32, air ? -0.9 : s * 0.9, 8, 7, 1.0, SKIN_BACK, 4);
+    // Torso + head
+    rr(x + 11, y - 37, 17, 21, 6, SHIRT);
+    circle(x + 21, y - 43, 8, SKIN);
+    ctx.fillStyle = BAND;
+    ctx.fillRect(x + 13, y - 48, 16, 3);
+    drawEye(x + 24, y - 43);
+    // Front limbs
+    limb(hipX, hipY, legA, 10, 9, air ? 0.1 : shinBend(legA), PANTS, 6);
+    limb(x + 20, y - 32, air ? 1.2 : -s * 0.9, 8, 7, 1.0, SKIN, 4);
+  }
+
+  function drawCactus(o, color, dark) {
+    for (const t of o.trunks) {
+      const bx = o.x + t.dx, top = GROUND - t.h;
+      const aw = Math.max(5, t.w * 0.36);
+      if (t.armL) {
+        const ay = top + t.h * t.armL;
+        rr(bx - aw * 1.3, ay, aw * 1.8, aw, aw / 2, color);
+        rr(bx - aw * 1.3, ay - t.h * 0.22, aw, t.h * 0.22 + aw, aw / 2, color);
+      }
+      if (t.armR) {
+        const ay = top + t.h * t.armR;
+        rr(bx + t.w - aw * 0.5, ay, aw * 1.8, aw, aw / 2, color);
+        rr(bx + t.w + aw * 0.3, ay - t.h * 0.2, aw, t.h * 0.2 + aw, aw / 2, color);
+      }
+      rr(bx, top, t.w, t.h + 2, t.w / 2.2, color);
+      line(bx + t.w / 2, top + 6, bx + t.w / 2, GROUND - 3, dark, 2);
+    }
+  }
+
+  function drawBird(o) {
+    const cx = o.x + o.w / 2, cy = o.y + o.h / 2;
+    const f = Math.sin(o.flap);
+    ctx.fillStyle = BIRD;
+    ctx.beginPath();
+    ctx.ellipse(cx + 2, cy + 2, 15, 7, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // tail
+    ctx.beginPath();
+    ctx.moveTo(cx + 14, cy + 1);
+    ctx.lineTo(cx + 24, cy - 5);
+    ctx.lineTo(cx + 24, cy + 7);
+    ctx.fill();
+    // wing
+    ctx.beginPath();
+    ctx.moveTo(cx - 6, cy);
+    ctx.lineTo(cx + 10, cy);
+    ctx.lineTo(cx + 4, cy - 16 * f);
+    ctx.fill();
+    circle(cx - 13, cy - 1, 6, BIRD);
+    ctx.fillStyle = BEAK;
+    ctx.beginPath();
+    ctx.moveTo(cx - 18, cy - 3);
+    ctx.lineTo(cx - 27, cy + 1);
+    ctx.lineTo(cx - 18, cy + 3);
+    ctx.fill();
+    circle(cx - 15, cy - 3, 1.6, '#fff');
+  }
+
+  function centerText(lines, color) {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = color;
+    lines.forEach(([text, size, dy]) => {
+      ctx.font = `bold ${size}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+      ctx.fillText(text, W / 2, H / 2 - 30 + dy);
+    });
+  }
+
+  function render() {
+    const n = night;
+    ctx.save();
+    if (shake > 0) ctx.translate(rand(-1, 1) * shake * 14, rand(-1, 1) * shake * 14);
+
+    // Sky
+    const sky = ctx.createLinearGradient(0, 0, 0, GROUND);
+    sky.addColorStop(0, mix('skyTop', n));
+    sky.addColorStop(1, mix('skyBot', n));
+    ctx.fillStyle = sky;
+    ctx.fillRect(-20, -20, W + 40, GROUND + 20);
+
+    if (n > 0.01) {
+      ctx.globalAlpha = n;
+      for (const s of stars) circle(s.x, s.y, s.r, '#fff');
+      circle(680, 60, 18, '#f5f3ce');
+      circle(688, 54, 16, mix('skyTop', n));
+      ctx.globalAlpha = 1;
+    }
+    if (n < 0.99) {
+      ctx.globalAlpha = 1 - n;
+      circle(680, 60, 22, '#ffe28a');
+      ctx.globalAlpha = 1;
+    }
+
+    for (const c of clouds) drawCloud(c, mix('cloud', n));
+    drawHills(farOff, GROUND - 40, 60, 0.006, mix('far', n));
+    drawHills(nearOff + 300, GROUND - 10, 34, 0.011, mix('near', n));
+
+    // Ground
+    ctx.fillStyle = mix('ground', n);
+    ctx.fillRect(-20, GROUND, W + 40, H - GROUND + 20);
+    line(-20, GROUND + 1, W + 20, GROUND + 1, mix('line', n), 2);
+    ctx.fillStyle = mix('pebble', n);
+    for (const pb of pebbles) ctx.fillRect(pb.x, pb.y, pb.w, 2);
+
+    // Obstacles
+    const cc = mix('cactus', n), cd = mix('cactusDark', n);
+    ctx.lineCap = 'round';
+    for (const o of obstacles) {
+      if (o.type === 'bird') drawBird(o);
+      else drawCactus(o, cc, cd);
+    }
+
+    drawPlayer();
+
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      circle(p.x, p.y, p.r, p.c || mix('line', n));
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // HUD
+    const textColor = mix('text', n);
+    ctx.font = 'bold 18px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'right';
+    const blinkHidden = flash > 0 && Math.floor(flash * 8) % 2 === 0;
+    ctx.fillStyle = textColor;
+    ctx.globalAlpha = 0.6;
+    ctx.fillText(`HI ${String(best).padStart(5, '0')}`, W - 110, 14);
+    ctx.globalAlpha = 1;
+    if (!blinkHidden) ctx.fillText(String(score()).padStart(5, '0'), W - 16, 14);
+    if (muted) {
+      ctx.textAlign = 'left';
+      ctx.font = 'bold 13px ui-monospace, SFMono-Regular, Menlo, monospace';
+      ctx.globalAlpha = 0.6;
+      ctx.fillText('SOUND OFF (M)', 16, 16);
+      ctx.globalAlpha = 1;
+    }
+
+    if (state === 'ready') {
+      centerText([
+        ['OFFLINE RUNNER', 34, 0],
+        ['Press SPACE or tap to start', 16, 40],
+      ], textColor);
+    } else if (state === 'paused') {
+      ctx.fillStyle = 'rgba(0,0,0,.3)';
+      ctx.fillRect(0, 0, W, H);
+      centerText([
+        ['PAUSED', 34, 0],
+        ['Press P or tap to resume', 16, 40],
+      ], '#fff');
+    } else if (state === 'over') {
+      ctx.fillStyle = 'rgba(0,0,0,.28)';
+      ctx.fillRect(0, 0, W, H);
+      const newBest = score() >= best && best > 0;
+      centerText([
+        ['GAME OVER', 34, 0],
+        [newBest ? `NEW BEST: ${score()}!` : `Score: ${score()}`, 18, 38],
+        overTimer > 0.45 ? ['Press SPACE or tap to run again', 15, 70] : ['', 15, 70],
+      ], '#fff');
+    }
+  }
+
+  // ---------- Input ----------
+  const JUMP_KEYS = ['Space', 'ArrowUp', 'KeyW'];
+  const DUCK_KEYS = ['ArrowDown', 'KeyS'];
+
+  window.addEventListener('keydown', e => {
+    if (JUMP_KEYS.includes(e.code)) {
+      e.preventDefault();
+      if (!e.repeat) pressJump();
+    } else if (DUCK_KEYS.includes(e.code)) {
+      e.preventDefault();
+      input.duck = true;
+    } else if (e.code === 'KeyP' || e.code === 'Escape') {
+      togglePause();
+    } else if (e.code === 'KeyM') {
+      toggleMute();
+    }
+  });
+  window.addEventListener('keyup', e => {
+    if (JUMP_KEYS.includes(e.code)) input.jump = false;
+    else if (DUCK_KEYS.includes(e.code)) input.duck = false;
+  });
+
+  // Pointer / touch: left side = duck, right side = jump. Any tap on menus starts.
+  const pointers = new Map();
+  canvas.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    const rect = canvas.getBoundingClientRect();
+    const leftSide = (e.clientX - rect.left) / rect.width < 0.35;
+    if (state === 'running' && leftSide) {
+      pointers.set(e.pointerId, 'duck');
+      input.duck = true;
+    } else {
+      pointers.set(e.pointerId, 'jump');
+      pressJump();
+    }
+  });
+  function pointerEnd(e) {
+    const kind = pointers.get(e.pointerId);
+    pointers.delete(e.pointerId);
+    if (kind === 'duck' && ![...pointers.values()].includes('duck')) input.duck = false;
+    if (kind === 'jump' && ![...pointers.values()].includes('jump')) input.jump = false;
+  }
+  canvas.addEventListener('pointerup', pointerEnd);
+  canvas.addEventListener('pointercancel', pointerEnd);
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  function releaseAll() {
+    input.jump = false;
+    input.duck = false;
+    pointers.clear();
+    if (state === 'running') state = 'paused';
+  }
+  window.addEventListener('blur', releaseAll);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+
+  // ---------- Main loop ----------
+  let last = performance.now(), acc = 0;
+  function frame(now) {
+    acc += Math.min(0.1, (now - last) / 1000);
+    last = now;
+    while (acc >= STEP) { update(STEP); acc -= STEP; }
+    render();
+    requestAnimationFrame(frame);
+  }
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
